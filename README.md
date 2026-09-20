@@ -2,7 +2,7 @@
 
 Install or update `ted-tools.py` through Blender's add-on preferences, then restart
 Blender if an older version is already loaded. The add-on appears in the 3D View's
-**N panel > Ted** tab. This version is 2.3.0 and supports Blender 4.5+.
+**N panel > Ted** tab. This version is 2.4.0 and supports Blender 4.5+.
 
 ## Export asset FBX files for Unity
 
@@ -31,13 +31,32 @@ output folder, and confirm the export.
 - Matching FBX files cause an error unless **Overwrite FBX Files** is enabled.
   Names are made safe for Windows, and colliding names receive numeric suffixes.
 
-Blender's **bottom status bar** shows a progress meter, the current asset/part,
-texture preparation, file publishing and cleanup. The bar reaches 100% only after
-temporary scenes have been removed. This is work progress, not an estimated time:
-one large mesh or FBX write may take longer than many small ones. The synchronous
-export updates between steps; it cannot update during a single Blender FBX call.
+Blender's **bottom status bar** shows a progress meter beside the current operation:
+asset/part preparation, textures, background FBX writing, publishing and cleanup.
+The bar reaches 100% only after temporary scenes have been removed. This is work
+progress, not an estimated time; it may hold steady while one large file is written.
+
+The UI operator advances using Blender's modal timer, returning control between
+textures, parts and files. The slow FBX writer runs in a **separate, hidden background
+Blender process** using a temporary snapshot of the prepared asset. The main window
+can keep drawing and handling viewport navigation while that process works. Scene
+editing is blocked in the export window to keep the asset consistent.
+
+Press **Esc** to cancel before publishing starts. Cancellation stops only the
+background process started by this export and removes the staged files and
+temporary scenes. Once publishing begins, the short finalization phase finishes
+instead of stopping with only some destination files replaced. The status bar
+shows when cancellation is available.
+
+Individual Blender operations such as evaluating a heavy modifier, saving an image
+or writing the temporary asset snapshot cannot be subdivided and can still pause
+the UI during preparation. FBX serialization itself no longer blocks the main UI.
+Temporary snapshots use space in the export folder and are removed automatically.
+Your open `.blend` is not saved, switched or reopened to start the worker.
+
 Timestamped `Ted FBX` messages in **Window > Toggle System Console** on Windows
-identify the last started operation if a step takes unusually long.
+identify the last started operation if a step takes unusually long. Background
+scripts using the synchronous helper still run to completion without UI timers.
 
 The exporter evaluates the source scene separately from the small asset-writing
 scene, avoids unnecessary material-related mesh copies, and removes each asset's
@@ -109,8 +128,14 @@ Run the integration tests in a background Blender process:
 The suite checks real FBX contents and import round trips, shared/packed/generated
 textures, unsaved paint, material overrides, name collisions, hidden/excluded
 objects, units and parent transforms, nested asset grouping, selected parents and
-children, progress completion/cleanup, overwrite protection, and cleanup after
-missing textures or an injected export failure. Tested on Blender 4.5 and 5.2.
+children, progress completion/cleanup, background-worker round trips, modal steps,
+worker cancellation, overwrite protection, and cleanup after missing textures or
+an injected export failure. Tested on Blender 4.5 and 5.2.
+
+`tests/test_modal_ui.py` is a separate-process GUI smoke test. It starts an export,
+checks real status-bar redraws and UI timer activity while the worker runs, and
+quits only its own test Blender. Run it only in a new factory-startup Blender
+process, never from a working Blender session.
 
 `tests/benchmark_individual_fbx.py` creates a small synthetic scene with 120 meshes
 in six parent groups in a separate Blender process, then times the export. It does

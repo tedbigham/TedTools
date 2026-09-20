@@ -3,6 +3,7 @@ import importlib.util
 import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 from types import SimpleNamespace
@@ -273,7 +274,7 @@ class IndividualFBXTests(unittest.TestCase):
     def test_progress_indicator_closes_on_error(self):
         wm = Mock()
         context = SimpleNamespace(window=bpy.context.window, scene=bpy.context.scene,
-                                  view_layer=bpy.context.view_layer, window_manager=wm)
+                                  view_layer=bpy.context.view_layer, window_manager=wm, workspace=Mock())
         with self.assertRaisesRegex(RuntimeError, 'Injected progress failure'):
             with addon._FBXExportProgress(context) as progress:
                 progress.update(0.5, 'Exporting asset 1/2')
@@ -282,9 +283,123 @@ class IndividualFBXTests(unittest.TestCase):
                 progress.draw(SimpleNamespace(layout=layout), context)
                 self.assertEqual(layout.row.return_value.progress.call_args.kwargs['factor'], 0.5)
                 raise RuntimeError('Injected progress failure')
-        wm.progress_begin.assert_called_once_with(0, 100)
-        wm.progress_end.assert_called_once()
-        self.assertTrue(all(call.args[0] == 50 for call in wm.progress_update.call_args_list))
+        context.workspace.status_text_set.assert_called_with(None)
+        wm.progress_begin.assert_not_called()  # No blocking progress cursor.
+
+    def test_generator_yields_with_original_context_and_paths_and_cancels(self):
+        root = bpy.data.objects.new('Group', None)
+        bpy.context.scene.collection.objects.link(root)
+        material = self.material(image=self.image_file('Source', (0, 1, 0, 1)))
+        for name in ('A', 'B'):
+            self.cube(name).parent = root
+            bpy.context.object.data.materials.append(material)
+        before = self.snapshot()
+        steps = addon._fbx_export_steps(bpy.context, str(self.output))
+        for factor, label in steps:
+            self.assertEqual(bpy.context.scene, before['scene'])
+            self.assertEqual(tuple(bpy.context.selected_objects), before['selected'])
+            self.assertEqual(bpy.context.view_layer.objects.active, before['active'])
+            self.assertEqual(self.snapshot()['images'], before['images'])
+            if 'part 3/3' in label:
+                break
+        steps.close()
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(list(self.output.iterdir()))
+
+    def test_background_writer_roundtrip_and_portable_textures(self):
+        root = bpy.data.objects.new('BackgroundGroup', None)
+        bpy.context.scene.collection.objects.link(root)
+        root.location = (10, 2, 3)
+        generated = bpy.data.images.new('Generated', width=2, height=2)
+        generated.pixels[:] = [0, 1, 0, 1] * 4
+        packed = self.image_file('Packed', (0, 0, 1, 1))
+        packed.pack()
+        os.remove(packed.filepath_raw)
+        for name, image in [('A', generated), ('B', packed)]:
+            obj = self.cube(name, (2, 0, 0))
+            obj.parent = root
+            obj.data.materials.append(self.material(name, image))
+        bpy.context.view_layer.update()
+        before = self.snapshot()
+        steps = addon._fbx_export_steps(bpy.context, str(self.output), background_fbx=True)
+        saw_worker = False
+        deadline = time.monotonic() + 45
+        try:
+            while True:
+                self.assertLess(time.monotonic(), deadline, 'Background worker timed out')
+                try:
+                    factor, label = next(steps)
+                except StopIteration as done:
+                    self.assertEqual(done.value[:2], (1, 2))
+                    break
+                self.assertEqual(bpy.context.scene, before['scene'])
+                self.assertEqual(self.snapshot()['images'], before['images'])
+                if 'writing FBX in background' in label:
+                    saw_worker = True
+                    time.sleep(0.01)
+        finally:
+            steps.close()
+        self.assertTrue(saw_worker)
+        self.assertEqual(self.snapshot(), before)
+        path = self.output / 'BackgroundGroup.fbx'
+        parsed = read_fbx(path)
+        self.assertEqual(len(elements(parsed, b'Geometry')), 2)
+        for ref in elements(parsed, b'RelativeFilename'):
+            self.assertTrue((self.output / ref.props[0].decode().replace('\\', '/')).is_file())
+        bpy.ops.import_scene.fbx(filepath=str(path))
+        for obj in bpy.context.selected_objects:
+            if obj.type == 'MESH':
+                self.assertLess((obj.matrix_world.translation - Vector((2, 0, 0))).length, 0.0001)
+
+    def test_cancel_background_writer_stops_only_owned_child_and_cleans_up(self):
+        self.cube('Asset')
+        before = self.snapshot()
+        workers = []
+        start = addon._FBXBackgroundWriter.start
+
+        def remember(writer, *args):
+            start(writer, *args)
+            workers.append(writer)
+
+        steps = addon._fbx_export_steps(bpy.context, str(self.output), background_fbx=True)
+        with patch.object(addon._FBXBackgroundWriter, 'start', remember):
+            try:
+                for factor, label in steps:
+                    if 'writing FBX in background' in label:
+                        break
+            finally:
+                steps.close()
+        self.assertEqual(len(workers), 1)
+        self.assertIsNotNone(workers[0].process.poll())
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(list(self.output.iterdir()))
+
+    def test_modal_services_one_step_and_cancels_on_escape(self):
+        operator = addon.OBJECT_OT_ted_export_individual_fbx
+        self.cube('Asset')
+        before = self.snapshot()
+        state = SimpleNamespace(
+            _steps=addon._fbx_export_steps(bpy.context, str(self.output)),
+            _timer=object(), _wm=Mock(), _started=time.perf_counter(),
+            _last_label=None, _next_tick=0.0, report=Mock(),
+            _progress=addon._FBXExportProgress(bpy.context))
+        state._stop = lambda: operator._stop(state)
+        state._report_complete = lambda result: operator._report_complete(state, result)
+        addon._active_fbx_export = state
+        try:
+            result = operator.modal(state, bpy.context, SimpleNamespace(type='TIMER', value='NOTHING'))
+            self.assertEqual(result, {'RUNNING_MODAL'})
+            self.assertEqual(state._progress.factor, 0.0)
+            self.assertFalse(self.output.exists())  # Only the initial step ran.
+            result = operator.modal(state, bpy.context, SimpleNamespace(type='MIDDLEMOUSE', value='PRESS'))
+            self.assertEqual(result, {'PASS_THROUGH'})
+            result = operator.modal(state, bpy.context, SimpleNamespace(type='ESC', value='PRESS'))
+            self.assertEqual(result, {'CANCELLED'})
+            self.assertIsNone(addon._active_fbx_export)
+            state._wm.event_timer_remove.assert_called_once()
+            self.assertEqual(self.snapshot(), before)
+        finally:
+            state._stop()
 
     def test_keep_positions_and_units_roundtrip(self):
         obj = self.cube('Positioned', (3, 5, 7))

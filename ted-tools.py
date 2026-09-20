@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Ted Tools",
     "author": "Ted Bigham",
-    "version": (2,3,0),
+    "version": (2,4,0),
     "blender": (4, 5, 0),
     "location": "3D View > N‑Panel > Ted",
     "description": "Assortment of technical tools.",
@@ -13,9 +13,11 @@ __version_str__ = ".".join(str(x) for x in __version__)
 
 import bpy, bmesh, math, colorsys
 import hashlib
+import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 from array import array
@@ -991,30 +993,36 @@ def _fbx_write_image(image, directory):
     return candidate, digest.hexdigest()
 
 
-@contextmanager
-def _fbx_shared_textures(materials, directory, progress=None):
-    """Temporarily point FBX at portable images; preserve names and shared materials."""
+def _fbx_texture_steps(materials, directory):
+    """Prepare one image per step without changing the source scene between ticks."""
     os.makedirs(directory, exist_ok=True)
-    saved, by_content = [], {}
+    paths, by_content = {}, {}
+    images = _fbx_material_images(materials)
+    for index, image in enumerate(images):
+        yield 0.12 + 0.18 * index / len(images), f'Textures {index + 1}/{len(images)}: {image.name}'
+        candidate, digest = _fbx_write_image(image, directory)
+        path = by_content.get(digest)
+        if path is None:
+            extension = os.path.splitext(candidate)[1]
+            stem = _fbx_safe_name(os.path.splitext(image.name)[0])
+            path = os.path.join(directory, f'{stem}_{digest[:16]}{extension}')
+            os.replace(candidate, path)
+            by_content[digest] = path
+        else:
+            os.remove(candidate)
+        paths[image] = path
+    return paths, len(by_content)
+
+
+@contextmanager
+def _fbx_texture_paths(paths):
+    """Only redirect paths during a synchronous write, never across UI events."""
+    saved = []
     try:
-        images = _fbx_material_images(materials)
-        for index, image in enumerate(images):
-            if progress:
-                progress(0.12 + 0.18 * index / len(images),
-                         f'Textures {index + 1}/{len(images)}: {image.name}')
-            candidate, digest = _fbx_write_image(image, directory)
-            path = by_content.get(digest)
-            if path is None:
-                extension = os.path.splitext(candidate)[1]
-                stem = _fbx_safe_name(os.path.splitext(image.name)[0])
-                path = os.path.join(directory, f'{stem}_{digest[:16]}{extension}')
-                os.replace(candidate, path)
-                by_content[digest] = path
-            else:
-                os.remove(candidate)
+        for image, path in paths.items():
             saved.append((image, image.filepath_raw, image.source))
             image.filepath_raw = path
-        yield len(by_content)
+        yield
     finally:
         for image, filepath, source in reversed(saved):
             image.filepath_raw = filepath
@@ -1044,30 +1052,23 @@ def _fbx_material_warnings(materials):
 
 
 class _FBXExportProgress:
-    """Window-manager feedback plus an actual bar in Blender's bottom status area."""
+    """Status-bar feedback, redrawn by Blender's regular event loop."""
 
     def __init__(self, context):
-        self.context = context
         self.window = context.window
-        self.scene = context.scene
-        self.view_layer = context.view_layer
-        self.wm = context.window_manager
+        self.workspace = context.workspace
         self.factor = 0.0
         self.label = 'Preparing export'
-        self.last_redraw = 0.0
-        self.phase = ''
         self.draw_callback = self.draw
         self.attached = False
 
     def draw(self, header, context):
         if context.window == self.window:
             row = header.layout.row()
-            row.ui_units_x = 32
-            row.progress(factor=self.factor, type='BAR',
-                         text=f'FBX {self.factor:.0%} | {self.label[:75]}')
+            row.ui_units_x = 14
+            row.progress(factor=self.factor, type='BAR', text=f'FBX {self.factor:.0%}')
 
     def __enter__(self):
-        self.wm.progress_begin(0, 100)
         if not bpy.app.background:
             bpy.types.STATUSBAR_HT_header.prepend(self.draw_callback)
             self.attached = True
@@ -1076,40 +1077,112 @@ class _FBXExportProgress:
     def update(self, factor, label):
         self.factor = min(1.0, max(self.factor, factor))
         self.label = label
-        self.wm.progress_update(self.factor * 100)
-        # Synchronous exporters do not return to Blender's event loop between
-        # files. Explicit, throttled redraws keep the status bar visible without
-        # introducing threads that access bpy or permitting scene edits mid-export.
-        phase = label.split(' ', 1)[0]
-        now = time.monotonic()
-        if phase != self.phase or now - self.last_redraw >= 0.25 or factor >= 0.97:
-            self.phase = phase
-            self.last_redraw = now
-            self.redraw()
-
-    def redraw(self):
-        if bpy.app.background or self.window is None:
-            return
-        try:
-            # Never draw the user's window with the temporary export context.
-            with self.context.temp_override(window=self.window, scene=self.scene,
-                                            view_layer=self.view_layer):
-                bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
-        except RuntimeError:
-            # A missing drawable window must not turn a completed file into an error.
-            pass
+        if self.workspace:
+            hint = ' | Esc to cancel' if self.factor < 0.92 else ''
+            self.workspace.status_text_set(text=label + hint)
 
     def __exit__(self, exc_type, exc_value, traceback):
         try:
             if self.attached:
                 bpy.types.STATUSBAR_HT_header.remove(self.draw_callback)
         finally:
-            self.wm.progress_end()
-            self.redraw()
+            if self.workspace:
+                self.workspace.status_text_set(None)
 
 
-def _fbx_export_asset(context, depsgraph, export_scene, root, members, filepath,
-                      keep_positions, progress):
+def _fbx_write_asset(context, scene, filepath, bake_space_transform):
+    objects = list(scene.objects)
+    active = next(obj for obj in objects if obj.parent is None)
+    with context.temp_override(scene=scene, view_layer=scene.view_layers[0],
+                               active_object=active, object=active,
+                               selected_objects=objects, selected_editable_objects=objects):
+        result = bpy.ops.export_scene.fbx(
+            filepath=filepath, check_existing=False,
+            use_selection=True, object_types={'MESH', 'EMPTY'},
+            use_mesh_modifiers=False, bake_anim=False,
+            axis_forward='-Z', axis_up='Y', global_scale=1.0,
+            apply_unit_scale=True, apply_scale_options='FBX_SCALE_UNITS',
+            bake_space_transform=bake_space_transform, mesh_smooth_type='OFF',
+            path_mode='RELATIVE', embed_textures=False,
+        )
+    if result != {'FINISHED'}:
+        raise RuntimeError(f'FBX export failed: {os.path.basename(filepath)}')
+
+
+def _fbx_worker_main(job_path):
+    """Entry point in our own background Blender, never in an existing session."""
+    with open(job_path, encoding='utf-8') as stream:
+        job = json.load(stream)
+    bpy.ops.wm.open_mainfile(filepath=job['snapshot'], load_ui=False, use_scripts=False)
+    _fbx_write_asset(bpy.context, bpy.data.scenes[job['scene']], job['filepath'], job['bake'])
+
+
+class _FBXBackgroundWriter:
+    def __init__(self):
+        self.process = None
+        self.log = None
+
+    def start(self, scene, filepath, paths, bake):
+        directory = os.path.dirname(filepath)
+        snapshot = os.path.join(directory, '_ted_asset.blend')
+        job_path = os.path.join(directory, '_ted_job.json')
+        runner = os.path.join(directory, '_ted_worker.py')
+        self.log_path = os.path.join(directory, '_ted_worker.log')
+        self.filepath = filepath
+        # Save just the evaluated asset and its dependencies; the user's .blend
+        # is neither saved nor switched. Packed/dirty pixels were staged already.
+        with _fbx_texture_paths(paths):
+            bpy.data.libraries.write(snapshot, {scene}, path_remap='ABSOLUTE', compress=False)
+        with open(job_path, 'w', encoding='utf-8') as stream:
+            json.dump({'snapshot': snapshot, 'scene': scene.name,
+                       'filepath': filepath, 'bake': bake}, stream)
+        with open(runner, 'w', encoding='utf-8') as stream:
+            stream.write(
+                'import importlib.util, sys\n'
+                f'spec = importlib.util.spec_from_file_location("ted_fbx_worker", {os.path.abspath(__file__)!r})\n'
+                'module = importlib.util.module_from_spec(spec)\n'
+                'spec.loader.exec_module(module)\n'
+                'module._fbx_worker_main(sys.argv[sys.argv.index("--") + 1])\n')
+        self.log = open(self.log_path, 'wb')
+        try:
+            self.process = subprocess.Popen(
+                [bpy.app.binary_path, '--background', '--factory-startup', '--disable-autoexec',
+                 '--threads', str(max(1, min(8, (os.cpu_count() or 2) - 1))),
+                 '--python-exit-code', '1', '--python', runner, '--', job_path],
+                stdout=self.log, stderr=subprocess.STDOUT,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        except Exception:
+            self.close()
+            raise
+
+    def finished(self):
+        code = self.process.poll()
+        if code is None:
+            return False
+        self.log.close()
+        self.log = None
+        if code != 0 or not os.path.isfile(self.filepath):
+            with open(self.log_path, encoding='utf-8', errors='replace') as stream:
+                detail = stream.read()[-2000:]
+            raise RuntimeError(f'Background FBX writer failed ({code}): {detail}')
+        return True
+
+    def close(self):
+        if self.process is not None and self.process.poll() is None:
+            # This handle belongs exclusively to the child created above.
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+        if self.log is not None:
+            self.log.close()
+            self.log = None
+
+
+def _fbx_export_asset_steps(context, depsgraph, export_scene, root, members, filepath,
+                            keep_positions, paths, background_fbx):
     # Include the ancestor chain so the asset's hierarchy and root pivot survive.
     nodes = set(members)
     for member in members:
@@ -1131,7 +1204,7 @@ def _fbx_export_asset(context, depsgraph, export_scene, root, members, filepath,
         offset = (Vector((0, 0, 0)) if keep_positions else
                   root.evaluated_get(depsgraph).matrix_world.translation.copy())
         for index, source in enumerate(nodes):
-            progress(0.9 * index / len(nodes), f'part {index + 1}/{len(nodes)}: {source.name}')
+            yield 0.9 * index / len(nodes), f'part {index + 1}/{len(nodes)}: {source.name}'
             depsgraph.update()
             evaluated = source.evaluated_get(depsgraph)
             matrix = evaluated.matrix_world.copy()
@@ -1155,41 +1228,32 @@ def _fbx_export_asset(context, depsgraph, export_scene, root, members, filepath,
             exported.matrix_basis = matrix
             matrices[source] = matrix
 
-        progress(0.9, f'writing FBX ({len(members)} meshes)')
-        objects = list(copies.values())
-        with context.temp_override(scene=export_scene, view_layer=export_scene.view_layers[0],
-                                   active_object=copies[root], object=copies[root],
-                                   selected_objects=objects, selected_editable_objects=objects):
-            result = bpy.ops.export_scene.fbx(
-                filepath=filepath, check_existing=False,
-                use_selection=True, object_types={'MESH', 'EMPTY'},
-                use_mesh_modifiers=False, bake_anim=False,
-                axis_forward='-Z', axis_up='Y', global_scale=1.0,
-                apply_unit_scale=True, apply_scale_options='FBX_SCALE_UNITS',
-                # Blender's experimental space baking misplaces nested empty
-                # transforms. Let FBX carry axis conversion for hierarchies.
-                bake_space_transform=len(nodes) == 1, mesh_smooth_type='OFF',
-                path_mode='RELATIVE', embed_textures=False,
-            )
-        if result != {'FINISHED'}:
-            raise RuntimeError(f'FBX export failed for "{root.name}"')
+        # Blender's experimental axis baking misplaces nested empty transforms.
+        if background_fbx:
+            yield 0.9, f'preparing background FBX ({len(members)} meshes)'
+            writer = _FBXBackgroundWriter()
+            try:
+                writer.start(export_scene, filepath, paths, len(nodes) == 1)
+                while not writer.finished():
+                    yield 0.95, 'writing FBX in background'
+            finally:
+                writer.close()
+        else:
+            yield 0.9, f'writing FBX ({len(members)} meshes)'
+            with _fbx_texture_paths(paths):
+                _fbx_write_asset(context, export_scene, filepath, len(nodes) == 1)
+        yield 0.98, 'releasing temporary asset meshes'
     finally:
-        progress(0.98, 'releasing temporary asset meshes')
         # Native bulk removal avoids repeated global reference scans per child.
         if copies or meshes:
             bpy.data.batch_remove(ids=[*copies.values(), *meshes])
 
 
-def _export_individual_fbx(context, directory, selected_only=False,
-                           keep_positions=False, overwrite=False, progress=None):
-    started = time.perf_counter()
-
-    def report(factor, label):
-        print(f'Ted FBX [{time.perf_counter() - started:.2f}s] {label}', flush=True)
-        if progress:
-            progress(factor, label)
-
-    report(0.0, 'Preparing export')
+def _fbx_export_steps(context, directory, selected_only=False,
+                      keep_positions=False, overwrite=False, background_fbx=False):
+    # No context override or temporary source-path change may span a yield.
+    # Generator.close() unwinds every resource on cancellation or errors.
+    yield 0.0, 'Preparing export'
     groups = _fbx_asset_groups(context, selected_only)
     if not groups:
         raise ValueError('No mesh objects to export')
@@ -1214,49 +1278,80 @@ def _export_individual_fbx(context, directory, selected_only=False,
             temporary.unit_settings.system = source_scene.unit_settings.system
             temporary.unit_settings.scale_length = source_scene.unit_settings.scale_length
             temporary.frame_set(source_scene.frame_current, subframe=source_scene.frame_subframe)
-        report(0.02, 'Preparing evaluation scene')
-        for obj in source_scene.objects:
+        source_objects = list(source_scene.objects)
+        for index, obj in enumerate(source_objects):
+            if index % 32 == 0:
+                yield 0.02 + 0.02 * index / len(source_objects), 'Preparing evaluation scene'
             scene.collection.objects.link(obj)
         view_layer = scene.view_layers[0]
+        yield 0.05, 'Evaluating scene and modifiers'
         with context.temp_override(scene=scene, view_layer=view_layer):
-            report(0.05, 'Evaluating scene and modifiers')
             depsgraph = context.evaluated_depsgraph_get()
-            # Gather evaluated materials too (e.g. a modifier assigning a material).
-            materials = {slot.material for obj in objects
-                         for slot in obj.evaluated_get(depsgraph).material_slots if slot.material}
-            warnings = _fbx_material_warnings(materials)
-            with tempfile.TemporaryDirectory(prefix='.ted-fbx-', dir=directory) as staging:
-                with _fbx_shared_textures(materials, os.path.join(staging, 'Textures'), report) as texture_count:
-                    for index, (root, filename) in enumerate(names.items()):
-                        def asset_progress(factor, detail):
-                            report(0.30 + 0.60 * (index + factor) / len(names),
-                                   f'Exporting asset {index + 1}/{len(names)} | {detail} | {root.name}')
-
-                        _fbx_export_asset(context, depsgraph, export_scene, root, groups[root],
-                                          os.path.join(staging, filename), keep_positions, asset_progress)
-                    report(0.90, 'Restoring source texture paths')
-                # Publish only after every FBX and texture has been generated successfully.
-                texture_dir = os.path.join(directory, 'Textures')
-                os.makedirs(texture_dir, exist_ok=True)
-                textures = os.listdir(os.path.join(staging, 'Textures'))
-                publish_count = len(textures) + len(names)
-                for index, filename in enumerate(textures):
-                    report(0.92 + 0.05 * index / publish_count,
-                           f'Publishing texture {index + 1}/{len(textures)}: {filename}')
-                    os.replace(os.path.join(staging, 'Textures', filename), os.path.join(texture_dir, filename))
-                for index, filename in enumerate(names.values()):
-                    report(0.92 + 0.05 * (len(textures) + index) / publish_count,
-                           f'Publishing FBX {index + 1}/{len(names)}: {filename}')
-                    os.replace(os.path.join(staging, filename), os.path.join(directory, filename))
-                report(0.97, 'Cleaning staging directory')
+        materials = set()
+        for index, obj in enumerate(objects):
+            if index % 32 == 0:
+                yield 0.06 + 0.03 * index / len(objects), 'Inspecting evaluated materials'
+            materials.update(slot.material for slot in obj.evaluated_get(depsgraph).material_slots if slot.material)
+        warnings = []
+        for index, material in enumerate(sorted(materials, key=lambda mat: mat.name)):
+            yield 0.09 + 0.02 * index / len(materials), f'Inspecting material: {material.name}'
+            warnings.extend(_fbx_material_warnings([material]))
+        with tempfile.TemporaryDirectory(prefix='.ted-fbx-', dir=directory) as staging:
+            paths, texture_count = yield from _fbx_texture_steps(materials, os.path.join(staging, 'Textures'))
+            for index, (root, filename) in enumerate(names.items()):
+                asset_steps = _fbx_export_asset_steps(
+                    context, depsgraph, export_scene, root, groups[root],
+                    os.path.join(staging, filename), keep_positions, paths, background_fbx)
+                try:
+                    for factor, detail in asset_steps:
+                        yield (0.30 + 0.60 * (index + factor) / len(names),
+                               f'Exporting asset {index + 1}/{len(names)} | {detail} | {root.name}')
+                finally:
+                    asset_steps.close()
+            # Once publication begins the UI finishes this short phase rather
+            # than cancelling after only some destination files have been replaced.
+            texture_dir = os.path.join(directory, 'Textures')
+            os.makedirs(texture_dir, exist_ok=True)
+            textures = os.listdir(os.path.join(staging, 'Textures'))
+            publish_count = len(textures) + len(names)
+            for index, filename in enumerate(textures):
+                yield (0.92 + 0.05 * index / publish_count,
+                       f'Publishing texture {index + 1}/{len(textures)}: {filename}')
+                os.replace(os.path.join(staging, 'Textures', filename), os.path.join(texture_dir, filename))
+            for index, filename in enumerate(names.values()):
+                yield (0.92 + 0.05 * (len(textures) + index) / publish_count,
+                       f'Publishing FBX {index + 1}/{len(names)}: {filename}')
+                os.replace(os.path.join(staging, filename), os.path.join(directory, filename))
+            yield 0.97, 'Cleaning staging directory'
+        yield 0.98, 'Cleaning export scene'
+        bpy.data.scenes.remove(export_scene)
+        export_scene = None
+        yield 0.99, 'Cleaning evaluation scene (releasing evaluated meshes)'
     finally:
-        report(0.98, 'Cleaning export scene')
         if export_scene is not None:
             bpy.data.scenes.remove(export_scene)
-        report(0.99, 'Cleaning evaluation scene (releasing evaluated meshes)')
         bpy.data.scenes.remove(scene)
-    report(1.0, f'Complete: {len(groups)} asset FBX files ({len(objects)} meshes) and {texture_count} textures')
+    yield 1.0, f'Complete: {len(groups)} asset FBX files ({len(objects)} meshes) and {texture_count} textures'
     return len(groups), texture_count, warnings
+
+
+def _export_individual_fbx(context, directory, selected_only=False,
+                           keep_positions=False, overwrite=False, progress=None):
+    """Synchronous driver for background scripts/tests; UI uses the modal driver."""
+    steps = _fbx_export_steps(context, directory, selected_only, keep_positions, overwrite)
+    try:
+        while True:
+            try:
+                factor, label = next(steps)
+            except StopIteration as complete:
+                return complete.value
+            if progress:
+                progress(factor, label)
+    finally:
+        steps.close()
+
+
+_active_fbx_export = None
 
 
 class OBJECT_OT_ted_export_individual_fbx(bpy.types.Operator):
@@ -1278,7 +1373,7 @@ class OBJECT_OT_ted_export_individual_fbx(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return context.mode == 'OBJECT'
+        return context.mode == 'OBJECT' and _active_fbx_export is None
 
     def invoke(self, context, event):
         if not self.directory:
@@ -1293,18 +1388,42 @@ class OBJECT_OT_ted_export_individual_fbx(bpy.types.Operator):
         self.layout.label(text='One FBX per top-level parent; shared textures')
 
     def execute(self, context):
+        global _active_fbx_export
         if not self.directory:
             self.report({'ERROR'}, 'Choose an export folder')
             return {'CANCELLED'}
+        directory = os.path.abspath(bpy.path.abspath(self.directory))
+        if not bpy.app.background:
+            self._steps = None
+            self._timer = None
+            self._progress = None
+            self._wm = context.window_manager
+            try:
+                self._progress = _FBXExportProgress(context)
+                self._progress.__enter__()
+                self._steps = _fbx_export_steps(context, directory, self.selected_only,
+                                               self.keep_positions, self.overwrite, background_fbx=True)
+                self._started = time.perf_counter()
+                self._last_label = None
+                self._next_tick = 0.0
+                self._timer = self._wm.event_timer_add(0.03, window=context.window)
+                self._wm.modal_handler_add(self)
+                _active_fbx_export = self
+                return {'RUNNING_MODAL'}
+            except Exception as exc:
+                self._stop()
+                self.report({'ERROR'}, f'Unable to start FBX export: {exc}')
+                return {'CANCELLED'}
         try:
-            with _FBXExportProgress(context) as progress:
-                count, textures, warnings = _export_individual_fbx(
-                    context, os.path.abspath(bpy.path.abspath(self.directory)),
-                    self.selected_only, self.keep_positions, self.overwrite,
-                    progress=progress.update)
+            result = _export_individual_fbx(context, directory, self.selected_only,
+                                           self.keep_positions, self.overwrite)
         except Exception as exc:
             self.report({'ERROR'}, f'Individual FBX export: {exc}')
             return {'CANCELLED'}
+        return self._report_complete(result)
+
+    def _report_complete(self, result):
+        count, textures, warnings = result
         if warnings:
             print('Ted FBX: materials needing Unity setup or texture baking:', ', '.join(warnings))
             self.report({'WARNING'}, f'Exported {count} FBX files, {textures} textures; '
@@ -1312,6 +1431,63 @@ class OBJECT_OT_ted_export_individual_fbx(bpy.types.Operator):
         else:
             self.report({'INFO'}, f'Exported {count} FBX files and {textures} shared textures')
         return {'FINISHED'}
+
+    def _stop(self):
+        global _active_fbx_export
+        try:
+            if self._steps is not None:
+                self._steps.close()
+                self._steps = None
+        finally:
+            try:
+                if self._timer is not None:
+                    self._wm.event_timer_remove(self._timer)
+                    self._timer = None
+            finally:
+                _active_fbx_export = None
+                if self._progress is not None:
+                    self._progress.__exit__(None, None, None)
+                    self._progress = None
+
+    def cancel(self, context):
+        self._stop()
+
+    def modal(self, context, event):
+        if self._steps is None:
+            return {'CANCELLED'}
+        if event.type == 'ESC' and event.value == 'PRESS':
+            if self._progress.factor < 0.92:
+                self._stop()
+                self.report({'INFO'}, 'FBX export cancelled; destination FBXs were not replaced')
+                return {'CANCELLED'}
+            return {'RUNNING_MODAL'}
+        if event.type == 'TIMER':
+            # Event exposes no timer identity in supported Blender releases.
+            # Rate-limit processing if other add-ons also generate TIMER events.
+            now = time.monotonic()
+            if now < self._next_tick:
+                return {'PASS_THROUGH'}
+            self._next_tick = now + 0.025
+            try:
+                factor, label = next(self._steps)
+                self._progress.update(factor, label)
+                if label != self._last_label:
+                    print(f'Ted FBX [{time.perf_counter() - self._started:.2f}s] {label}', flush=True)
+                    self._last_label = label
+            except StopIteration as complete:
+                self._stop()
+                return self._report_complete(complete.value)
+            except Exception as exc:
+                self._stop()
+                self.report({'ERROR'}, f'FBX export: {exc}')
+                return {'CANCELLED'}
+            return {'RUNNING_MODAL'}
+        # Permit navigation/redraw while protecting the asset snapshot from edits.
+        if event.type in {'MIDDLEMOUSE', 'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE',
+                          'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN',
+                          'TRACKPADZOOM', 'MOUSEROTATE', 'NDOF_MOTION'}:
+            return {'PASS_THROUGH'}
+        return {'RUNNING_MODAL'}
 
 
 class VIEW3D_PT_misc(bpy.types.Panel):
@@ -1359,6 +1535,8 @@ def register():
 
 
 def unregister():
+    if _active_fbx_export is not None:
+        _active_fbx_export._stop()
     for c in reversed(classes): bpy.utils.unregister_class(c)
     del bpy.types.Scene.fumes_cluster
 
