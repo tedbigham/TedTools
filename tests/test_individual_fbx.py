@@ -109,6 +109,81 @@ class IndividualFBXTests(unittest.TestCase):
             references.append(refs)
         self.assertEqual(references[0], references[1])
 
+    def test_multiple_material_face_assignments_survive_both_export_paths(self):
+        root = bpy.data.objects.new('MultiMaterialGroup', None)
+        bpy.context.scene.collection.objects.link(root)
+        materials = [self.material(name, self.image_file(name, color)) for name, color in
+                     [('Stone', (1, 0, 0, 1)), ('Roof', (0, 1, 0, 1)), ('Wood', (0, 0, 1, 1))]]
+        obj = self.cube('Building')
+        obj.parent = root
+        for material in materials:
+            obj.data.materials.append(material)
+        for face in obj.data.polygons:
+            face.material_index = face.index % 3
+        # Linked geometry with an object-level override must retain its own slots.
+        shared = obj.copy()
+        shared.name = 'SharedBuilding'
+        bpy.context.scene.collection.objects.link(shared)
+        override = self.material('Paint', materials[0].node_tree.nodes.get('Image Texture').image)
+        shared.material_slots[1].link = 'OBJECT'
+        shared.material_slots[1].material = override
+        bpy.context.view_layer.update()
+        expected = [face.material_index for face in obj.data.polygons]
+        expected_names = {'Building': ['Stone', 'Roof', 'Wood'],
+                          'SharedBuilding': ['Stone', 'Paint', 'Wood']}
+        original_slots = {source: [slot.material for slot in source.material_slots] for source in (obj, shared)}
+        for background in (False, True):
+            with self.subTest(background=background):
+                destination = self.output / str(background)
+                steps = addon._fbx_export_steps(bpy.context, str(destination), background_fbx=background)
+                deadline = time.monotonic() + 45
+                try:
+                    for _, label in steps:
+                        self.assertLess(time.monotonic(), deadline, 'Background worker timed out')
+                        if 'preparing background' in label or 'writing FBX (' in label:
+                            for exported in bpy.data.scenes['__TedFBXExport'].objects:
+                                if exported.type == 'MESH':
+                                    self.assertTrue(all(not mat.is_evaluated for mat in exported.data.materials))
+                        if 'writing FBX in background' in label:
+                            time.sleep(0.01)
+                finally:
+                    steps.close()
+                path = destination / 'MultiMaterialGroup.fbx'
+                tree = read_fbx(path)
+                names = {node.props[1].split(b'\x00\x01')[0].decode() for node in elements(tree, b'Material')}
+                self.assertEqual(names, {'Stone', 'Roof', 'Wood', 'Paint'})
+                # FBX may reorder slots; resolve per-face indices through each
+                # model's material connections instead of assuming Blender's order.
+                material_names = {node.props[0]: node.props[1].split(b'\x00\x01')[0].decode()
+                                  for node in elements(tree, b'Material')}
+                model_names = {node.props[0]: node.props[1].split(b'\x00\x01')[0].decode()
+                               for node in elements(tree, b'Model')}
+                links = [node.props for node in elements(tree, b'C') if node.props[0] == b'OO']
+                geometries = elements(tree, b'Geometry')
+                self.assertEqual(len(geometries), 2)
+                for geometry in geometries:
+                    model = next(parent for _, child, parent in links if child == geometry.props[0])
+                    slots = [material_names[child] for _, child, parent in links
+                             if parent == model and child in material_names]
+                    indices = elements(geometry, b'Materials')[0].props[0]
+                    key = 'SharedBuilding' if model_names[model].startswith('SharedBuilding') else 'Building'
+                    self.assertEqual([slots[index] for index in indices],
+                                     [expected_names[key][index] for index in expected])
+                self.assertEqual(len(list((destination / 'Textures').iterdir())), 3)
+                for ref in elements(tree, b'RelativeFilename'):
+                    self.assertTrue((destination / ref.props[0].decode().replace('\\', '/')).is_file())
+                self.assertEqual([face.material_index for face in obj.data.polygons], expected)
+                for source, slots in original_slots.items():
+                    self.assertEqual([slot.material for slot in source.material_slots], slots)
+        bpy.ops.import_scene.fbx(filepath=str(path))
+        for imported in bpy.context.selected_objects:
+            if imported.type != 'MESH':
+                continue
+            key = 'SharedBuilding' if imported.name.startswith('SharedBuilding') else 'Building'
+            for face in imported.data.polygons:
+                actual = imported.material_slots[face.material_index].material.name
+                self.assertTrue(actual.startswith(expected_names[key][expected[face.index]]), actual)
+
     def test_generated_dirty_images_and_filename_collisions(self):
         red = self.image_file('Red', (1, 0, 0, 1))
         blue = self.image_file('Blue', (0, 0, 1, 1))
@@ -249,6 +324,107 @@ class IndividualFBXTests(unittest.TestCase):
         self.assertEqual(len(elements(read_fbx(self.output / 'MeshRoot.fbx'), b'Geometry')), 2)
         self.assertTrue((self.output / 'Standalone.fbx').is_file())
         self.assertFalse((self.output / 'Child.fbx').exists())
+
+    def test_collection_groups_include_nested_meshes_and_deduplicate_members(self):
+        a = bpy.data.collections.new('Wasteland_Bldg_SM_A_grp')
+        b = bpy.data.collections.new('Wasteland_Bldg_MD_B_grp')
+        empty = bpy.data.collections.new('Empty')
+        for collection in (a, b, empty):
+            bpy.context.scene.collection.children.link(collection)
+        nested = bpy.data.collections.new('Nested Details')
+        a.children.link(nested)
+        material = self.material('Shared')
+
+        def mesh(name, collection):
+            obj = self.cube(name)
+            bpy.context.scene.collection.objects.unlink(obj)
+            collection.objects.link(obj)
+            obj.data.materials.append(material)
+            return obj
+
+        mesh('Floor', a)
+        shared = mesh('Nested Metal', nested)
+        a.objects.link(shared)  # Multiple memberships within A must not duplicate geometry.
+        b.objects.link(shared)  # Each independent asset does include the shared mesh.
+        mesh('Concrete', b)
+        self.cube('Loose Scene Mesh')
+        bpy.context.view_layer.layer_collection.children[a.name].exclude = True
+        before = self.snapshot()
+        self.assertEqual(self.export(grouping='COLLECTION')[:2], (2, 0))
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual({file.name for file in self.output.glob('*.fbx')}, {a.name + '.fbx', b.name + '.fbx'})
+        for collection in (a, b):
+            parsed = read_fbx(self.output / (collection.name + '.fbx'))
+            self.assertEqual(len(elements(parsed, b'Geometry')), 2)
+            self.assertEqual(len(elements(parsed, b'Material')), 1)
+
+    def test_collection_selected_assets_include_unselected_siblings(self):
+        a = bpy.data.collections.new('Collection A')
+        b = bpy.data.collections.new('Collection B')
+        bpy.context.scene.collection.children.link(a)
+        bpy.context.scene.collection.children.link(b)
+        selected = None
+        for collection, name in [(a, 'Selected'), (a, 'Sibling'), (b, 'Other')]:
+            obj = self.cube(name)
+            bpy.context.scene.collection.objects.unlink(obj)
+            collection.objects.link(obj)
+            if name == 'Selected':
+                selected = obj
+        bpy.ops.object.select_all(action='DESELECT')
+        selected.select_set(True)
+        result = bpy.ops.object.ted_export_individual_fbx(
+            directory=str(self.output), selected_only=True, grouping='COLLECTION')
+        self.assertEqual(result, {'FINISHED'})
+        self.assertEqual([path.name for path in self.output.glob('*.fbx')], ['Collection A.fbx'])
+        self.assertEqual(len(elements(read_fbx(self.output / 'Collection A.fbx'), b'Geometry')), 2)
+
+    def test_collection_background_export_pivot_and_external_parent(self):
+        collection = bpy.data.collections.new('Collection Asset')
+        collection.instance_offset = (10, 20, 0)
+        bpy.context.scene.collection.children.link(collection)
+        outside = self.cube('Outside Parent', (7, 4, 2))
+        outside.rotation_euler.z = 0.3
+        inside = self.cube('Inside', (2, 1, 3))
+        inside.parent = outside
+        bpy.context.scene.collection.objects.unlink(inside)
+        collection.objects.link(inside)
+        other = self.cube('Other Part', (5, 6, 7))
+        bpy.context.scene.collection.objects.unlink(other)
+        collection.objects.link(other)
+        bpy.context.view_layer.update()
+        before = self.snapshot()
+        for keep in (False, True):
+            destination = self.output / str(keep)
+            steps = addon._fbx_export_steps(bpy.context, str(destination), grouping='COLLECTION',
+                                           keep_positions=keep, background_fbx=True)
+            deadline = time.monotonic() + 45
+            try:
+                for _, label in steps:
+                    self.assertLess(time.monotonic(), deadline)
+                    if 'writing FBX in background' in label:
+                        time.sleep(0.01)
+            finally:
+                steps.close()
+            self.assertEqual(self.snapshot(), before)
+            path = destination / 'Collection Asset.fbx'
+            self.assertEqual(len(elements(read_fbx(path), b'Geometry')), 2)
+            bpy.ops.import_scene.fbx(filepath=str(path))
+            imported = list(bpy.context.selected_objects)
+            for obj in imported:
+                if obj.type != 'MESH':
+                    continue
+                source = inside if obj.name.startswith('Inside') else other
+                offset = Vector((0, 0, 0)) if keep else collection.instance_offset
+                expected = sorted(tuple(source.matrix_world @ vertex.co - offset) for vertex in source.data.vertices)
+                actual = sorted(tuple(obj.matrix_world @ vertex.co) for vertex in obj.data.vertices)
+                for a, b in zip(actual, expected):
+                    self.assertLess((Vector(a) - Vector(b)).length, 0.0001)
+            meshes = [obj.data for obj in imported if obj.type == 'MESH']
+            bpy.data.batch_remove(ids=[*imported, *meshes])
+            # Import changes selection; restore it for the next export's state check.
+            for obj in before['selected']:
+                obj.select_set(True)
+            bpy.context.view_layer.objects.active = before['active']
 
     def test_progress_includes_cleanup_and_ends_only_after_release(self):
         root = bpy.data.objects.new('Group', None)

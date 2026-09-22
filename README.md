@@ -2,12 +2,43 @@
 
 Install or update `ted-tools.py` through Blender's add-on preferences, then restart
 Blender if an older version is already loaded. The add-on appears in the 3D View's
-**N panel > Ted** tab. This version is 2.4.0 and supports Blender 4.5+.
+**N panel > Ted** tab. This version is 2.5.0 and supports Blender 4.5+.
+
+Version 2.4.1 fixes material slots collapsing to one material in background exports.
+The worker snapshot now uses persistent original material datablocks rather than
+evaluated dependency-graph copies, retaining per-face assignments and object-level
+material overrides. Re-export affected assets after updating the add-on.
 
 ## Export asset FBX files for Unity
 
 In **Object Mode**, click **Ted > Misc > Export Asset FBX Files**, choose an
 output folder, and confirm the export.
+
+Choose **Group By** in the export dialog:
+
+- **Parent Objects** (default) retains the existing grouping by top-level object
+  parent, described below.
+- **Top-level Collections** exports each direct child of **Scene Collection** as
+  one FBX named after that collection. All meshes in nested subcollections are
+  included in that same file. For example, `Wasteland_Bldg_SM_A_grp` and
+  `Wasteland_Bldg_MD_B_grp` produce two FBXs containing their respective parts.
+
+In collection mode, **Selected Assets Only** includes whole top-level collections
+containing a selected object. Select a mesh or other object within the collection;
+highlighting a collection row in the Outliner alone is not used as the selection.
+An object linked into multiple nested collections is included only once per FBX.
+If linked into two different top-level collections, it is included in both assets.
+Hidden/excluded meshes are included. Empty collections and objects directly in
+Scene Collection are skipped in this mode; use Parent Objects for loose objects.
+
+Collections have no object origin, so their **instance offset** supplies the pivot
+(zero by default). With **Keep Scene Positions** off, that offset is subtracted
+from every part's world position; it never recenters parts individually. With it
+on, world positions are preserved. Mesh parenting inside a collection is retained.
+Parents outside it do not bring unrelated meshes into the export; their children's
+world transforms are preserved under the exported asset root instead.
+
+For **Parent Objects** grouping:
 
 - Each top-level parent and all its mesh descendants become **one FBX**, named
   after that parent. For example, `KB3D_FTW_BldgLgAirTrafficControl_A_grp` and all
@@ -128,7 +159,8 @@ Run the integration tests in a background Blender process:
 The suite checks real FBX contents and import round trips, shared/packed/generated
 textures, unsaved paint, material overrides, name collisions, hidden/excluded
 objects, units and parent transforms, nested asset grouping, selected parents and
-children, progress completion/cleanup, background-worker round trips, modal steps,
+children, recursive collection grouping and pivots, shared collection memberships,
+progress completion/cleanup, background-worker round trips, modal steps,
 worker cancellation, overwrite protection, and cleanup after missing textures or
 an injected export failure. Tested on Blender 4.5 and 5.2.
 

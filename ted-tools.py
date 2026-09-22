@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Ted Tools",
     "author": "Ted Bigham",
-    "version": (2,4,0),
+    "version": (2,5,0),
     "blender": (4, 5, 0),
     "location": "3D View > N‑Panel > Ted",
     "description": "Assortment of technical tools.",
@@ -22,7 +22,7 @@ import tempfile
 import time
 from array import array
 from contextlib import contextmanager
-from mathutils import Vector
+from mathutils import Matrix, Vector
 from mathutils.bvhtree import BVHTree
 from mathutils.kdtree import KDTree
 from collections import deque, defaultdict
@@ -904,8 +904,21 @@ def _fbx_object_names(objects):
     return names
 
 
-def _fbx_asset_groups(context, selected_only):
-    """The top-level parent is an asset, even when a child mesh is selected."""
+def _fbx_asset_groups(context, selected_only, grouping='PARENT'):
+    """Resolve complete assets from parent hierarchies or top-level collections."""
+    if grouping == 'COLLECTION':
+        selected = set(context.selected_objects)
+        groups = {}
+        for collection in context.scene.collection.children:
+            contents = set(collection.all_objects)
+            if selected_only and not contents.intersection(selected):
+                continue
+            meshes = sorted((obj for obj in contents if obj.type == 'MESH'), key=lambda obj: obj.name)
+            if meshes:
+                groups[collection] = meshes
+        return groups
+    if grouping != 'PARENT':
+        raise ValueError(f'Unknown asset grouping: {grouping}')
     scene_objects = set(context.scene.objects)
     roots = {}
 
@@ -1184,15 +1197,17 @@ class _FBXBackgroundWriter:
 def _fbx_export_asset_steps(context, depsgraph, export_scene, root, members, filepath,
                             keep_positions, paths, background_fbx):
     # Include the ancestor chain so the asset's hierarchy and root pivot survive.
+    is_collection = isinstance(root, bpy.types.Collection)
+    allowed = set(root.all_objects) if is_collection else None
     nodes = set(members)
     for member in members:
-        while member != root:
+        while member != root and (not is_collection or member.parent in allowed):
             member = member.parent
             nodes.add(member)
 
     def depth(obj):
         count = 0
-        while obj != root:
+        while obj != root and (not is_collection or obj.parent in nodes):
             count += 1
             obj = obj.parent
         return count
@@ -1201,8 +1216,16 @@ def _fbx_export_asset_steps(context, depsgraph, export_scene, root, members, fil
     copies, meshes, matrices = {}, [], {}
     try:
         depsgraph.update()
-        offset = (Vector((0, 0, 0)) if keep_positions else
-                  root.evaluated_get(depsgraph).matrix_world.translation.copy())
+        pivot = (root.instance_offset.copy() if is_collection else
+                 root.evaluated_get(depsgraph).matrix_world.translation.copy())
+        offset = Vector((0, 0, 0)) if keep_positions else pivot
+        if is_collection:
+            # Collections have no object transform. Use their instance offset as
+            # the asset pivot and preserve every child's position relative to it.
+            copies[root] = bpy.data.objects.new(_fbx_safe_name(root.name), None)
+            export_scene.collection.objects.link(copies[root])
+            matrices[root] = Matrix.Translation(pivot - offset)
+            copies[root].matrix_basis = matrices[root]
         for index, source in enumerate(nodes):
             yield 0.9 * index / len(nodes), f'part {index + 1}/{len(nodes)}: {source.name}'
             depsgraph.update()
@@ -1214,17 +1237,22 @@ def _fbx_export_asset_steps(context, depsgraph, export_scene, root, members, fil
                 mesh = bpy.data.meshes.new_from_object(evaluated, preserve_all_data_layers=True,
                                                        depsgraph=depsgraph)
                 meshes.append(mesh)
-                # Resolve object overrides onto the private mesh, avoiding a second
-                # mesh copy inside the FBX exporter for OBJECT-linked materials.
+                # Resolve object overrides onto the private mesh. Evaluated material
+                # IDs are transient dependency-graph copies: persisting them in the
+                # worker snapshot can collapse slots to the first material on load.
+                # Use persistent originals and retain slot order / polygon indices.
                 for index, slot in enumerate(evaluated.material_slots):
                     if index < len(mesh.materials):
-                        mesh.materials[index] = slot.material
+                        mesh.materials[index] = slot.material.original if slot.material else None
             exported = bpy.data.objects.new(_fbx_safe_name(source.name), mesh)
             copies[source] = exported
             export_scene.collection.objects.link(exported)
-            if source != root:
-                exported.parent = copies[source.parent]
-                exported.matrix_parent_inverse = matrices[source.parent].inverted_safe()
+            if is_collection or source != root:
+                # A parent outside this collection must not pull in unrelated
+                # meshes. Reparent its child to the export root in world space.
+                parent = source.parent if source.parent in copies else root
+                exported.parent = copies[parent]
+                exported.matrix_parent_inverse = matrices[parent].inverted_safe()
             exported.matrix_basis = matrix
             matrices[source] = matrix
 
@@ -1233,7 +1261,7 @@ def _fbx_export_asset_steps(context, depsgraph, export_scene, root, members, fil
             yield 0.9, f'preparing background FBX ({len(members)} meshes)'
             writer = _FBXBackgroundWriter()
             try:
-                writer.start(export_scene, filepath, paths, len(nodes) == 1)
+                writer.start(export_scene, filepath, paths, len(nodes) == 1 and not is_collection)
                 while not writer.finished():
                     yield 0.95, 'writing FBX in background'
             finally:
@@ -1241,7 +1269,7 @@ def _fbx_export_asset_steps(context, depsgraph, export_scene, root, members, fil
         else:
             yield 0.9, f'writing FBX ({len(members)} meshes)'
             with _fbx_texture_paths(paths):
-                _fbx_write_asset(context, export_scene, filepath, len(nodes) == 1)
+                _fbx_write_asset(context, export_scene, filepath, len(nodes) == 1 and not is_collection)
         yield 0.98, 'releasing temporary asset meshes'
     finally:
         # Native bulk removal avoids repeated global reference scans per child.
@@ -1250,14 +1278,14 @@ def _fbx_export_asset_steps(context, depsgraph, export_scene, root, members, fil
 
 
 def _fbx_export_steps(context, directory, selected_only=False,
-                      keep_positions=False, overwrite=False, background_fbx=False):
+                      keep_positions=False, overwrite=False, background_fbx=False, grouping='PARENT'):
     # No context override or temporary source-path change may span a yield.
     # Generator.close() unwinds every resource on cancellation or errors.
     yield 0.0, 'Preparing export'
-    groups = _fbx_asset_groups(context, selected_only)
+    groups = _fbx_asset_groups(context, selected_only, grouping)
     if not groups:
         raise ValueError('No mesh objects to export')
-    objects = [obj for members in groups.values() for obj in members]
+    objects = sorted({obj for members in groups.values() for obj in members}, key=lambda obj: obj.name)
     names = _fbx_object_names(groups)
     os.makedirs(directory, exist_ok=True)
     existing = {name.casefold() for name in os.listdir(directory)}
@@ -1291,7 +1319,8 @@ def _fbx_export_steps(context, directory, selected_only=False,
         for index, obj in enumerate(objects):
             if index % 32 == 0:
                 yield 0.06 + 0.03 * index / len(objects), 'Inspecting evaluated materials'
-            materials.update(slot.material for slot in obj.evaluated_get(depsgraph).material_slots if slot.material)
+            materials.update(slot.material.original
+                             for slot in obj.evaluated_get(depsgraph).material_slots if slot.material)
         warnings = []
         for index, material in enumerate(sorted(materials, key=lambda mat: mat.name)):
             yield 0.09 + 0.02 * index / len(materials), f'Inspecting material: {material.name}'
@@ -1336,9 +1365,9 @@ def _fbx_export_steps(context, directory, selected_only=False,
 
 
 def _export_individual_fbx(context, directory, selected_only=False,
-                           keep_positions=False, overwrite=False, progress=None):
+                           keep_positions=False, overwrite=False, progress=None, grouping='PARENT'):
     """Synchronous driver for background scripts/tests; UI uses the modal driver."""
-    steps = _fbx_export_steps(context, directory, selected_only, keep_positions, overwrite)
+    steps = _fbx_export_steps(context, directory, selected_only, keep_positions, overwrite, grouping=grouping)
     try:
         while True:
             try:
@@ -1357,16 +1386,21 @@ _active_fbx_export = None
 class OBJECT_OT_ted_export_individual_fbx(bpy.types.Operator):
     bl_idname = 'object.ted_export_individual_fbx'
     bl_label = 'Export Asset FBX Files'
-    bl_description = 'Export each top-level parent and its mesh descendants as one Unity FBX with shared textures'
+    bl_description = 'Export parent hierarchies or top-level collections as Unity FBXs with shared textures'
 
     directory: bpy.props.StringProperty(name='Export Folder', subtype='DIR_PATH')
     filter_folder: bpy.props.BoolProperty(default=True, options={'HIDDEN'})
+    grouping: bpy.props.EnumProperty(
+        name='Group By', default='PARENT',
+        items=[('PARENT', 'Parent Objects', 'One FBX per top-level parent and its mesh descendants'),
+               ('COLLECTION', 'Top-level Collections',
+                'One FBX per direct child of Scene Collection, including meshes in nested subcollections')])
     selected_only: bpy.props.BoolProperty(
         name='Selected Assets Only', default=False,
-        description='Select a parent or any child to export its whole top-level asset; otherwise export all scene assets')
+        description='Export whole assets containing a selected object; otherwise export all assets in the chosen grouping')
     keep_positions: bpy.props.BoolProperty(
         name='Keep Scene Positions', default=False,
-        description='Keep world positions; otherwise put each asset root at zero and preserve the offsets of its parts')
+        description='Keep world positions; otherwise subtract the parent origin or collection instance offset from all parts')
     overwrite: bpy.props.BoolProperty(
         name='Overwrite FBX Files', default=False,
         description='Replace matching FBX files in the chosen folder')
@@ -1382,10 +1416,15 @@ class OBJECT_OT_ted_export_individual_fbx(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def draw(self, context):
+        self.layout.prop(self, 'grouping')
         self.layout.prop(self, 'selected_only')
         self.layout.prop(self, 'keep_positions')
         self.layout.prop(self, 'overwrite')
-        self.layout.label(text='One FBX per top-level parent; shared textures')
+        if self.grouping == 'COLLECTION':
+            self.layout.label(text='Includes meshes in nested subcollections')
+            self.layout.label(text='Pivot: collection instance offset')
+        else:
+            self.layout.label(text='One FBX per top-level parent; shared textures')
 
     def execute(self, context):
         global _active_fbx_export
@@ -1402,7 +1441,8 @@ class OBJECT_OT_ted_export_individual_fbx(bpy.types.Operator):
                 self._progress = _FBXExportProgress(context)
                 self._progress.__enter__()
                 self._steps = _fbx_export_steps(context, directory, self.selected_only,
-                                               self.keep_positions, self.overwrite, background_fbx=True)
+                                               self.keep_positions, self.overwrite, background_fbx=True,
+                                               grouping=self.grouping)
                 self._started = time.perf_counter()
                 self._last_label = None
                 self._next_tick = 0.0
@@ -1416,7 +1456,7 @@ class OBJECT_OT_ted_export_individual_fbx(bpy.types.Operator):
                 return {'CANCELLED'}
         try:
             result = _export_individual_fbx(context, directory, self.selected_only,
-                                           self.keep_positions, self.overwrite)
+                                           self.keep_positions, self.overwrite, grouping=self.grouping)
         except Exception as exc:
             self.report({'ERROR'}, f'Individual FBX export: {exc}')
             return {'CANCELLED'}
